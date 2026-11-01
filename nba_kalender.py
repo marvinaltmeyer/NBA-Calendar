@@ -25,12 +25,12 @@ from zoneinfo import ZoneInfo
 # ---------------------------------------------------------------------------
 ZEITZONE = "Europe/Berlin"
 FENSTER_START = "07:00"   # fruehester Anwurf (deutsche Zeit)
-FENSTER_ENDE = "00:30"    # spaetester Anwurf (deutsche Zeit, inklusive)
+FENSTER_ENDE = "23:59"    # spaetester Anwurf (deutsche Zeit, inklusive)
 NUR_TEAMS = []            # leer = alle Teams; sonst ESPN-Kuerzel, z.B. ["LAL", "BOS", "GS"]
 SPIELDAUER_MIN = 150      # Laenge des Kalendereintrags in Minuten
 TAGE_ZURUECK = 14         # vergangene Spiele, die im Kalender bleiben
 TAGE_VORAUS = 270         # wie weit in die Zukunft geladen wird (deckt Playoffs ab)
-KALENDERNAME = "NBA (Anwurf 7–0:30 Uhr)"
+KALENDERNAME = "NBA (Anwurf 7–23:59 Uhr)"
 OUTPUT = "nba.ics"
 # ---------------------------------------------------------------------------
 
