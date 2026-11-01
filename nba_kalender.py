@@ -28,6 +28,7 @@ FENSTER_START = "07:00"   # fruehester Anwurf (deutsche Zeit)
 FENSTER_ENDE = "23:59"    # spaetester Anwurf (deutsche Zeit, inklusive)
 NUR_TEAMS = []            # leer = alle Teams; sonst ESPN-Kuerzel, z.B. ["LAL", "BOS", "GS"]
 SPIELDAUER_MIN = 150      # Laenge des Kalendereintrags in Minuten
+AM_TAGESENDE_KAPPEN = True  # Eintraege enden spaetestens um 23:59 am Anwurftag
 TAGE_ZURUECK = 14         # vergangene Spiele, die im Kalender bleiben
 TAGE_VORAUS = 270         # wie weit in die Zukunft geladen wird (deckt Playoffs ab)
 KALENDERNAME = "NBA (Anwurf 7–23:59 Uhr)"
@@ -202,12 +203,17 @@ def baue_ics_events(events):
         ort = ", ".join(x for x in (venue.get("fullName"),
                                     (venue.get("address") or {}).get("city")) if x)
 
+        spielende = anwurf + timedelta(minutes=SPIELDAUER_MIN)
+        if AM_TAGESENDE_KAPPEN:
+            tagesende = lokal.replace(hour=23, minute=59, second=0, microsecond=0)
+            spielende = min(spielende, tagesende)
+
         zeilen = [
             "BEGIN:VEVENT",
             f"UID:{ev.get('id', datum)}@nba-kalender",
             f"DTSTAMP:{jetzt}",
             f"DTSTART:{fmt_utc(anwurf)}",
-            f"DTEND:{fmt_utc(anwurf + timedelta(minutes=SPIELDAUER_MIN))}",
+            f"DTEND:{fmt_utc(spielende)}",
             f"SUMMARY:{ics_escape(summary)}",
             f"DESCRIPTION:{ics_escape(chr(10).join(beschreibung))}",
         ]
