@@ -13,6 +13,8 @@ Aufruf:
 
 import argparse
 import json
+import os
+import re
 import sys
 import time as zeit
 import urllib.error
@@ -33,78 +35,96 @@ TAGE_ZURUECK = 14         # vergangene Spiele, die im Kalender bleiben
 TAGE_VORAUS = 270         # wie weit in die Zukunft geladen wird (deckt Playoffs ab)
 KALENDERNAME = "NBA (Anwurf 7–23:59 Uhr)"
 OUTPUT = "nba.ics"
+MAX_FEHLTAGE_ANTEIL = 0.3  # scheitern mehr Tage als dieser Anteil, wird abgebrochen
 # ---------------------------------------------------------------------------
 
-ESPN_BASIS = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+ESPN_SERVER = [
+    "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+    "https://site.web.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+]
 TZ = ZoneInfo(ZEITZONE)
+TZ_US = ZoneInfo("America/New_York")  # ESPN-Tage sind US-Ostkuesten-Tage
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json",
+}
 
 
-def hole_json(url, versuche=3):
-    """Laedt JSON. 4xx-Fehler werden sofort weitergereicht, 5xx/Netzfehler wiederholt."""
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept": "application/json",
-    })
+# ---------------------------------------------------------------------------
+# Laden
+# ---------------------------------------------------------------------------
+def hole_tag(tag, versuche=4):
+    """Laedt die Spiele eines US-Tages. Wechselt bei Problemen den Server."""
+    letzter_fehler = None
     for i in range(versuche):
+        url = f"{ESPN_SERVER[i % len(ESPN_SERVER)]}?dates={tag:%Y%m%d}"
         try:
+            req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=60) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
-            if 400 <= e.code < 500 or i == versuche - 1:
-                raise
-            print(f"Versuch {i + 1} fehlgeschlagen ({e}), neuer Versuch ...")
+                roh = r.read()
+            try:
+                return json.loads(roh).get("events", []) or []
+            except ValueError:
+                vorschau = roh[:120].decode("utf-8", "replace").replace("\n", " ")
+                raise ValueError(f"keine JSON-Antwort ({len(roh)} Byte): {vorschau!r}")
         except Exception as e:
-            if i == versuche - 1:
-                raise
-            print(f"Versuch {i + 1} fehlgeschlagen ({e}), neuer Versuch ...")
-        zeit.sleep(5 * (i + 1))
-
-
-def lade_bloecke(start, ende):
-    """Schneller Weg: ganze Monate auf einmal abfragen."""
-    events = {}
-    block_start = start
-    while block_start <= ende:
-        block_ende = min(block_start + timedelta(days=30), ende)
-        url = (f"{ESPN_BASIS}?limit=500&dates="
-               f"{block_start:%Y%m%d}-{block_ende:%Y%m%d}")
-        block = hole_json(url).get("events", []) or []
-        if len(block) >= 500:
-            raise ValueError("Monatsblock hat das Limit erreicht")
-        for ev in block:
-            events[ev.get("id")] = ev
-        block_start = block_ende + timedelta(days=1)
-    return events
-
-
-def lade_tageweise(start, ende):
-    """Sicherer Weg: jeden Tag einzeln abfragen."""
-    events = {}
-    tag = start
-    while tag <= ende:
-        url = f"{ESPN_BASIS}?dates={tag:%Y%m%d}"
-        for ev in hole_json(url).get("events", []) or []:
-            events[ev.get("id")] = ev
-        tag += timedelta(days=1)
-        zeit.sleep(0.2)
-    return events
+            letzter_fehler = e
+            if i < versuche - 1:
+                warte = [5, 15, 30, 60][min(i, 3)]
+                print(f"  {tag}: Versuch {i + 1} fehlgeschlagen ({e}) – neuer Versuch in {warte}s")
+                zeit.sleep(warte)
+    raise RuntimeError(f"{tag}: endgueltig fehlgeschlagen ({letzter_fehler})")
 
 
 def lade_events():
+    """Laedt alle Spiele im Zeitraum Tag fuer Tag. Gibt (events, fehltage) zurueck."""
     heute = date.today()
-    start = heute - timedelta(days=TAGE_ZURUECK)
+    tag = heute - timedelta(days=TAGE_ZURUECK)
     ende = heute + timedelta(days=TAGE_VORAUS)
-    try:
-        events = lade_bloecke(start, ende)
-        print("Spielplan in Monatsbloecken geladen.")
-    except Exception as e:
-        print(f"Monatsabfrage nicht moeglich ({e}) – lade tageweise ...")
-        events = lade_tageweise(start, ende)
-        print("Spielplan tageweise geladen.")
-    return list(events.values())
+    gesamt_tage = (ende - tag).days + 1
+    max_fehltage = int(gesamt_tage * MAX_FEHLTAGE_ANTEIL)
+    events, fehltage, anzahl_tage, in_folge = {}, set(), 0, 0
+    while tag <= ende:
+        anzahl_tage += 1
+        try:
+            for ev in hole_tag(tag):
+                events[ev.get("id")] = ev
+            in_folge = 0
+        except RuntimeError as e:
+            print(f"WARNUNG: {e}")
+            fehltage.add(tag)
+            in_folge += 1
+            if in_folge >= 5 or len(fehltage) > max_fehltage:
+                sys.exit(f"Fehler: ESPN liefert gerade keine Daten ({len(fehltage)} Tage "
+                         "fehlgeschlagen) – Abbruch, alter Kalender bleibt bestehen.")
+        tag += timedelta(days=1)
+        zeit.sleep(0.3)
+    print(f"{anzahl_tage - len(fehltage)} von {anzahl_tage} Tagen geladen.")
+    return list(events.values()), fehltage
 
 
+def alte_events_fuer_tage(pfad, tage):
+    """Holt aus dem bisherigen Kalender die Eintraege fuer die angegebenen US-Tage."""
+    if not tage or not os.path.exists(pfad):
+        return []
+    with open(pfad, encoding="utf-8") as f:
+        text = f.read().replace("\r\n ", "").replace("\n ", "")  # Zeilen entfalten
+    ergebnis = []
+    for block in re.findall(r"BEGIN:VEVENT\r?\n(.*?)END:VEVENT", text, re.S):
+        zeilen = [z for z in re.split(r"\r?\n", block) if z]
+        dtstart = next((z for z in zeilen if z.startswith("DTSTART:")), None)
+        if not dtstart:
+            continue
+        anwurf = datetime.strptime(dtstart[8:], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        if anwurf.astimezone(TZ_US).date() in tage:
+            ergebnis.append((anwurf, ["BEGIN:VEVENT"] + zeilen + ["END:VEVENT"]))
+    return ergebnis
+
+
+# ---------------------------------------------------------------------------
+# Kalender bauen
+# ---------------------------------------------------------------------------
 def parse_hhmm(s):
     h, m = s.split(":")
     return time(int(h), int(m))
@@ -148,10 +168,11 @@ def fmt_utc(dt):
 
 
 def baue_ics_events(events):
+    """Gibt eine Liste von (anwurf, zeilen) fuer alle Spiele im Fenster zurueck."""
     start, ende = parse_hhmm(FENSTER_START), parse_hhmm(FENSTER_ENDE)
     teams_filter = {t.upper() for t in NUR_TEAMS}
     jetzt = fmt_utc(datetime.now(timezone.utc))
-    ergebnis, behalten = [], 0
+    ergebnis = []
 
     for ev in events:
         comp = (ev.get("competitions") or [{}])[0]
@@ -180,7 +201,6 @@ def baue_ics_events(events):
         if teams_filter and not (kuerzel & teams_filter):
             continue
 
-        behalten += 1
         name_gast = gast.get("displayName") or "TBD"
         name_heim = heim.get("displayName") or "TBD"
         summary = f"🏀 {name_gast} @ {name_heim}"
@@ -222,12 +242,20 @@ def baue_ics_events(events):
         zeilen.append("END:VEVENT")
         ergebnis.append((anwurf, zeilen))
 
-    ergebnis.sort(key=lambda x: x[0])
-    return [z for _, z in ergebnis], behalten
+    return ergebnis
 
 
-def schreibe_ics(events, pfad):
-    zeilen = [
+def schreibe_ics(eintraege, pfad):
+    # doppelte UIDs entfernen, nach Anwurf sortieren
+    gesehen, eindeutig = set(), []
+    for anwurf, zeilen in sorted(eintraege, key=lambda x: x[0]):
+        uid = next((z for z in zeilen if z.startswith("UID:")), None)
+        if uid in gesehen:
+            continue
+        gesehen.add(uid)
+        eindeutig.append(zeilen)
+
+    kopf = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//nba-kalender//gefiltert//DE",
@@ -238,11 +266,10 @@ def schreibe_ics(events, pfad):
         "REFRESH-INTERVAL;VALUE=DURATION:PT6H",
         "X-PUBLISHED-TTL:PT6H",
     ]
-    for ev in events:
-        zeilen.extend(ev)
-    zeilen.append("END:VCALENDAR")
+    zeilen = kopf + [z for ev in eindeutig for z in ev] + ["END:VCALENDAR"]
     with open(pfad, "w", encoding="utf-8", newline="") as f:
         f.write("\r\n".join(fold(z) for z in zeilen) + "\r\n")
+    return len(eindeutig)
 
 
 def main():
@@ -253,16 +280,21 @@ def main():
 
     if args.input:
         with open(args.input, encoding="utf-8") as f:
-            events = json.load(f)["events"]
+            daten = json.load(f)
+        events, fehltage = daten["events"], {date.fromisoformat(t) for t in daten.get("fehltage", [])}
     else:
-        events = lade_events()
+        events, fehltage = lade_events()
 
     if not events:
         sys.exit("Fehler: keine Spiele geladen – alter Kalender bleibt bestehen.")
-    ics_events, behalten = baue_ics_events(events)
-    schreibe_ics(ics_events, args.output)
-    print(f"{behalten} von {len(events)} Spielen im Fenster "
-          f"{FENSTER_START}–{FENSTER_ENDE} Uhr -> {args.output}")
+
+    eintraege = baue_ics_events(events)
+    alte = alte_events_fuer_tage(args.output, fehltage)
+    if alte:
+        print(f"{len(alte)} Eintraege fuer nicht ladbare Tage aus altem Kalender uebernommen.")
+    anzahl = schreibe_ics(eintraege + alte, args.output)
+    print(f"{anzahl} Spiele im Fenster {FENSTER_START}–{FENSTER_ENDE} Uhr "
+          f"(von {len(events)} geladenen) -> {args.output}")
 
 
 if __name__ == "__main__":
