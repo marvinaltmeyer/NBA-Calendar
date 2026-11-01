@@ -2,20 +2,21 @@
 """
 Gefilterter NBA-Kalender.
 
-Holt den offiziellen NBA-Spielplan (aktuelle Saison), behaelt nur Spiele,
-deren Anwurf in deutscher Zeit (Europe/Berlin) im gewuenschten Zeitfenster
-liegt, und schreibt eine abonnierbare .ics-Datei.
+Holt den NBA-Spielplan (Datenquelle: ESPN), behaelt nur Spiele, deren
+Anwurf in deutscher Zeit (Europe/Berlin) im gewuenschten Zeitfenster liegt,
+und schreibt eine abonnierbare .ics-Datei.
 
 Aufruf:
-    python nba_kalender.py                      # Spielplan von nba.com laden
-    python nba_kalender.py --input plan.json    # lokale JSON-Datei (Test)
+    python nba_kalender.py                      # Spielplan von ESPN laden
+    python nba_kalender.py --input events.json  # lokale Testdaten
 """
 
 import argparse
 import json
 import sys
+import time as zeit
 import urllib.request
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
@@ -24,31 +25,55 @@ from zoneinfo import ZoneInfo
 ZEITZONE = "Europe/Berlin"
 FENSTER_START = "07:00"   # fruehester Anwurf (deutsche Zeit)
 FENSTER_ENDE = "00:30"    # spaetester Anwurf (deutsche Zeit, inklusive)
-NUR_TEAMS = []            # leer = alle Teams; sonst z.B. ["LAL", "BOS", "GSW"]
+NUR_TEAMS = []            # leer = alle Teams; sonst ESPN-Kuerzel, z.B. ["LAL", "BOS", "GS"]
 SPIELDAUER_MIN = 150      # Laenge des Kalendereintrags in Minuten
+TAGE_ZURUECK = 14         # vergangene Spiele, die im Kalender bleiben
+TAGE_VORAUS = 270         # wie weit in die Zukunft geladen wird (deckt Playoffs ab)
 KALENDERNAME = "NBA (Anwurf 7–0:30 Uhr)"
 OUTPUT = "nba.ics"
 # ---------------------------------------------------------------------------
 
-SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
+ESPN_URL = ("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
+            "scoreboard?limit=1000&dates={von}-{bis}")
 TZ = ZoneInfo(ZEITZONE)
 
 
-def lade_spielplan(pfad=None):
-    if pfad:
-        with open(pfad, encoding="utf-8") as f:
-            return json.load(f)
-    req = urllib.request.Request(
-        SCHEDULE_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Accept": "application/json",
-            "Referer": "https://www.nba.com/",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)
+def hole_json(url, versuche=3):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json",
+    })
+    for i in range(versuche):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.load(r)
+        except Exception as e:
+            if i == versuche - 1:
+                raise
+            print(f"Versuch {i + 1} fehlgeschlagen ({e}), neuer Versuch ...")
+            zeit.sleep(5 * (i + 1))
+
+
+def lade_events():
+    """Laedt alle Spiele im Zeitraum, in Monatsbloecken."""
+    heute = date.today()
+    start = heute - timedelta(days=TAGE_ZURUECK)
+    ende = heute + timedelta(days=TAGE_VORAUS)
+    events = {}
+    block_start = start
+    while block_start <= ende:
+        block_ende = min(block_start + timedelta(days=30), ende)
+        url = ESPN_URL.format(von=block_start.strftime("%Y%m%d"),
+                              bis=block_ende.strftime("%Y%m%d"))
+        daten = hole_json(url)
+        block = daten.get("events", []) or []
+        if len(block) >= 1000:
+            print(f"Warnung: Block ab {block_start} hat das Limit erreicht.")
+        for ev in block:
+            events[ev.get("id")] = ev
+        block_start = block_ende + timedelta(days=1)
+    return list(events.values())
 
 
 def parse_hhmm(s):
@@ -61,15 +86,6 @@ def im_fenster(t, start, ende):
     if start <= ende:
         return start <= t <= ende
     return t >= start or t <= ende
-
-
-def teamname(team):
-    if not team:
-        return "TBD"
-    stadt = (team.get("teamCity") or "").strip()
-    name = (team.get("teamName") or "").strip()
-    voll = f"{stadt} {name}".strip()
-    return voll or team.get("teamTricode") or "TBD"
 
 
 def ics_escape(text):
@@ -85,8 +101,7 @@ def ics_escape(text):
 
 def fold(line):
     """Zeilen nach RFC 5545 auf max. 75 Byte umbrechen (UTF-8-sicher)."""
-    raw = line.encode("utf-8")
-    if len(raw) <= 75:
+    if len(line.encode("utf-8")) <= 75:
         return line
     teile, aktuell, limit = [], b"", 75
     for ch in line:
@@ -103,73 +118,78 @@ def fmt_utc(dt):
     return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def tv_sender(spiel):
-    try:
-        nat = spiel.get("broadcasters", {}).get("nationalBroadcasters", []) or []
-        namen = [b.get("broadcasterDisplay") for b in nat if b.get("broadcasterDisplay")]
-        return ", ".join(dict.fromkeys(namen))
-    except Exception:
-        return ""
-
-
-def baue_events(daten):
+def baue_ics_events(events):
     start, ende = parse_hhmm(FENSTER_START), parse_hhmm(FENSTER_ENDE)
     teams_filter = {t.upper() for t in NUR_TEAMS}
     jetzt = fmt_utc(datetime.now(timezone.utc))
-    events, gesamt, behalten = [], 0, 0
+    ergebnis, behalten = [], 0
 
-    for tag in daten["leagueSchedule"]["gameDates"]:
-        for spiel in tag.get("games", []):
-            gesamt += 1
-            status_text = (spiel.get("gameStatusText") or "").upper()
-            if "TBD" in status_text:
-                continue  # Anwurfzeit steht noch nicht fest
-            if str(spiel.get("postponedStatus") or "").upper() in {"Y", "P", "PPD"}:
-                continue
-            utc_str = spiel.get("gameDateTimeUTC")
-            if not utc_str:
-                continue
-            anwurf = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
-            lokal = anwurf.astimezone(TZ)
-            if not im_fenster(lokal.time().replace(second=0, microsecond=0), start, ende):
-                continue
+    for ev in events:
+        comp = (ev.get("competitions") or [{}])[0]
+        if comp.get("timeValid") is False:
+            continue  # Anwurfzeit steht noch nicht fest
+        status = (((comp.get("status") or ev.get("status") or {})
+                   .get("type") or {}).get("name") or "").upper()
+        if "POSTPONED" in status or "CANCELED" in status or "CANCELLED" in status:
+            continue
+        datum = ev.get("date")
+        if not datum:
+            continue
+        anwurf = datetime.fromisoformat(datum.replace("Z", "+00:00"))
+        lokal = anwurf.astimezone(TZ)
+        if not im_fenster(lokal.time().replace(second=0, microsecond=0), start, ende):
+            continue
 
-            heim, gast = spiel.get("homeTeam") or {}, spiel.get("awayTeam") or {}
-            if teams_filter and not (
-                (heim.get("teamTricode") or "").upper() in teams_filter
-                or (gast.get("teamTricode") or "").upper() in teams_filter
-            ):
-                continue
+        heim = gast = {}
+        for c in comp.get("competitors", []) or []:
+            if c.get("homeAway") == "home":
+                heim = c.get("team") or {}
+            elif c.get("homeAway") == "away":
+                gast = c.get("team") or {}
+        kuerzel = {(heim.get("abbreviation") or "").upper(),
+                   (gast.get("abbreviation") or "").upper()}
+        if teams_filter and not (kuerzel & teams_filter):
+            continue
 
-            behalten += 1
-            summary = f"🏀 {teamname(gast)} @ {teamname(heim)}"
-            beschreibung = []
-            for feld in ("gameLabel", "gameSubLabel", "seriesText"):
-                if spiel.get(feld):
-                    beschreibung.append(spiel[feld])
-            tv = tv_sender(spiel)
-            if tv:
-                beschreibung.append(f"TV (USA): {tv}")
-            beschreibung.append(f"Anwurf: {lokal:%d.%m.%Y, %H:%M} Uhr (deutsche Zeit)")
-            ort = ", ".join(
-                x for x in (spiel.get("arenaName"), spiel.get("arenaCity")) if x
-            )
+        behalten += 1
+        name_gast = gast.get("displayName") or "TBD"
+        name_heim = heim.get("displayName") or "TBD"
+        summary = f"🏀 {name_gast} @ {name_heim}"
 
-            zeilen = [
-                "BEGIN:VEVENT",
-                f"UID:{spiel.get('gameId', utc_str)}@nba-kalender",
-                f"DTSTAMP:{jetzt}",
-                f"DTSTART:{fmt_utc(anwurf)}",
-                f"DTEND:{fmt_utc(anwurf + timedelta(minutes=SPIELDAUER_MIN))}",
-                f"SUMMARY:{ics_escape(summary)}",
-                f"DESCRIPTION:{ics_escape(chr(10).join(beschreibung))}",
-            ]
-            if ort:
-                zeilen.append(f"LOCATION:{ics_escape(ort)}")
-            zeilen.append("END:VEVENT")
-            events.append(zeilen)
+        beschreibung = []
+        if (ev.get("season") or {}).get("type") == 3:
+            beschreibung.append("Playoffs")
+        for n in comp.get("notes", []) or []:
+            if n.get("headline"):
+                beschreibung.append(n["headline"])
+        tv = []
+        for b in comp.get("broadcasts", []) or []:
+            if b.get("market") == "national":
+                tv.extend(b.get("names") or [])
+        if tv:
+            beschreibung.append("TV (USA): " + ", ".join(dict.fromkeys(tv)))
+        beschreibung.append(f"Anwurf: {lokal:%d.%m.%Y, %H:%M} Uhr (deutsche Zeit)")
 
-    return events, gesamt, behalten
+        venue = comp.get("venue") or {}
+        ort = ", ".join(x for x in (venue.get("fullName"),
+                                    (venue.get("address") or {}).get("city")) if x)
+
+        zeilen = [
+            "BEGIN:VEVENT",
+            f"UID:{ev.get('id', datum)}@nba-kalender",
+            f"DTSTAMP:{jetzt}",
+            f"DTSTART:{fmt_utc(anwurf)}",
+            f"DTEND:{fmt_utc(anwurf + timedelta(minutes=SPIELDAUER_MIN))}",
+            f"SUMMARY:{ics_escape(summary)}",
+            f"DESCRIPTION:{ics_escape(chr(10).join(beschreibung))}",
+        ]
+        if ort:
+            zeilen.append(f"LOCATION:{ics_escape(ort)}")
+        zeilen.append("END:VEVENT")
+        ergebnis.append((anwurf, zeilen))
+
+    ergebnis.sort(key=lambda x: x[0])
+    return [z for _, z in ergebnis], behalten
 
 
 def schreibe_ics(events, pfad):
@@ -193,17 +213,21 @@ def schreibe_ics(events, pfad):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", help="lokale Spielplan-JSON statt Download")
+    ap.add_argument("--input", help="lokale JSON-Datei mit ESPN-Events (Test)")
     ap.add_argument("--output", default=OUTPUT)
     args = ap.parse_args()
 
-    daten = lade_spielplan(args.input)
-    events, gesamt, behalten = baue_events(daten)
-    if gesamt == 0:
-        sys.exit("Fehler: Spielplan enthaelt keine Spiele – nichts geschrieben.")
-    schreibe_ics(events, args.output)
-    saison = daten.get("leagueSchedule", {}).get("seasonYear", "?")
-    print(f"Saison {saison}: {behalten} von {gesamt} Spielen im Fenster "
+    if args.input:
+        with open(args.input, encoding="utf-8") as f:
+            events = json.load(f)["events"]
+    else:
+        events = lade_events()
+
+    if not events:
+        sys.exit("Fehler: keine Spiele geladen – alter Kalender bleibt bestehen.")
+    ics_events, behalten = baue_ics_events(events)
+    schreibe_ics(ics_events, args.output)
+    print(f"{behalten} von {len(events)} Spielen im Fenster "
           f"{FENSTER_START}–{FENSTER_ENDE} Uhr -> {args.output}")
 
 
