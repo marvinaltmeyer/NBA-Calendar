@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 import time as zeit
+import urllib.error
 import urllib.request
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -33,12 +34,12 @@ KALENDERNAME = "NBA (Anwurf 7–0:30 Uhr)"
 OUTPUT = "nba.ics"
 # ---------------------------------------------------------------------------
 
-ESPN_URL = ("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
-            "scoreboard?limit=1000&dates={von}-{bis}")
+ESPN_BASIS = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 TZ = ZoneInfo(ZEITZONE)
 
 
 def hole_json(url, versuche=3):
+    """Laedt JSON. 4xx-Fehler werden sofort weitergereicht, 5xx/Netzfehler wiederholt."""
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -48,31 +49,58 @@ def hole_json(url, versuche=3):
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.load(r)
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500 or i == versuche - 1:
+                raise
+            print(f"Versuch {i + 1} fehlgeschlagen ({e}), neuer Versuch ...")
         except Exception as e:
             if i == versuche - 1:
                 raise
             print(f"Versuch {i + 1} fehlgeschlagen ({e}), neuer Versuch ...")
-            zeit.sleep(5 * (i + 1))
+        zeit.sleep(5 * (i + 1))
 
 
-def lade_events():
-    """Laedt alle Spiele im Zeitraum, in Monatsbloecken."""
-    heute = date.today()
-    start = heute - timedelta(days=TAGE_ZURUECK)
-    ende = heute + timedelta(days=TAGE_VORAUS)
+def lade_bloecke(start, ende):
+    """Schneller Weg: ganze Monate auf einmal abfragen."""
     events = {}
     block_start = start
     while block_start <= ende:
         block_ende = min(block_start + timedelta(days=30), ende)
-        url = ESPN_URL.format(von=block_start.strftime("%Y%m%d"),
-                              bis=block_ende.strftime("%Y%m%d"))
-        daten = hole_json(url)
-        block = daten.get("events", []) or []
-        if len(block) >= 1000:
-            print(f"Warnung: Block ab {block_start} hat das Limit erreicht.")
+        url = (f"{ESPN_BASIS}?limit=500&dates="
+               f"{block_start:%Y%m%d}-{block_ende:%Y%m%d}")
+        block = hole_json(url).get("events", []) or []
+        if len(block) >= 500:
+            raise ValueError("Monatsblock hat das Limit erreicht")
         for ev in block:
             events[ev.get("id")] = ev
         block_start = block_ende + timedelta(days=1)
+    return events
+
+
+def lade_tageweise(start, ende):
+    """Sicherer Weg: jeden Tag einzeln abfragen."""
+    events = {}
+    tag = start
+    while tag <= ende:
+        url = f"{ESPN_BASIS}?dates={tag:%Y%m%d}"
+        for ev in hole_json(url).get("events", []) or []:
+            events[ev.get("id")] = ev
+        tag += timedelta(days=1)
+        zeit.sleep(0.2)
+    return events
+
+
+def lade_events():
+    heute = date.today()
+    start = heute - timedelta(days=TAGE_ZURUECK)
+    ende = heute + timedelta(days=TAGE_VORAUS)
+    try:
+        events = lade_bloecke(start, ende)
+        print("Spielplan in Monatsbloecken geladen.")
+    except Exception as e:
+        print(f"Monatsabfrage nicht moeglich ({e}) – lade tageweise ...")
+        events = lade_tageweise(start, ende)
+        print("Spielplan tageweise geladen.")
     return list(events.values())
 
 
